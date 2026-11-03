@@ -1,0 +1,12 @@
+{
+  "bets": [
+    "2026-11-03|1|Barcelona Wins",
+    "2026-11-03|2|Bodo Glimt Win or Draw",
+    "2026-11-03|3|Inter Win or Draw"
+  ],
+  "dailySpend": {
+    "2026-11-03": 5.40299
+  },
+  "lastCleanup": "2026-11-03",
+  "searchRetries": {}
+}

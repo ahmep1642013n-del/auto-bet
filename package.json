@@ -1,0 +1,26 @@
+{
+  "name": "sx-bet-auto-bettor",
+  "version": "2.0.0",
+  "type": "module",
+  "description": "Auto-betting daemon: reads Firebase predictions and places bets on SX Bet",
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "scripts": {
+    "start": "node server.mjs",
+    "bot": "node auto-bet.mjs",
+    "dry-run": "node auto-bet.mjs --dry-run",
+    "once": "node auto-bet.mjs --once",
+    "test": "node auto-bet.mjs --once --dry-run"
+  },
+  "dependencies": {
+    "dotenv": "^16.4.5",
+    "ethers": "^6.13.0",
+    "firebase-admin": "^12.0.0",
+    "https-proxy-agent": "^9.1.0",
+    "mongodb": "^7.8.0",
+    "node-fetch": "^3.3.2",
+    "socks-proxy-agent": "^10.1.0",
+    "ssh2": "^1.17.0"
+  }
+}
