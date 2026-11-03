@@ -46,8 +46,16 @@ const RUN_ONCE = process.argv.includes('--once');
 const CHECK_INTERVAL_MS = 10 * 60 * 1000; // 10 minutes
 const MAX_BETS_PER_CYCLE = 5;
 const SX_API_BASE = 'https://api.sx.bet';
-const SX_API_KEY = process.env.sx_bet_API;
-const SX_PRIVATE_KEY = process.env.PRIVATE_KEY;
+function cleanEnv(val) {
+  if (!val) return '';
+  let s = String(val).trim();
+  if ((s.startsWith('"') && s.endsWith('"')) || (s.startsWith("'") && s.endsWith("'"))) {
+    s = s.slice(1, -1);
+  }
+  return s.trim();
+}
+const SX_API_KEY = cleanEnv(process.env.sx_bet_API || process.env.SX_BET_API);
+const SX_PRIVATE_KEY = cleanEnv(process.env.PRIVATE_KEY);
 const FETCH_TIMEOUT_MS = 15_000;
 const MAX_SEARCH_RETRIES = 6; // Max times to retry "match not found" before giving up (6 × 10min = 1 hour)
 const BET_LOG_FILE = join(__dirname, 'bet-history.json');
@@ -67,7 +75,7 @@ let mongoCol = null;
 
 async function initMongo() {
   if (mongoCol) return mongoCol;
-  const uri = process.env.MONGODB_URI;
+  const uri = cleanEnv(process.env.MONGODB_URI);
   if (!uri) throw new Error('Missing MONGODB_URI in .env');
   const client = new MongoClient(uri);
   await client.connect();
@@ -177,8 +185,7 @@ let firebaseInitialized = false;
 
 function initFirebase() {
   if (firebaseInitialized) return getFirestore();
-  let raw = process.env.FIREBASE_SERVICE_ACCOUNT || '';
-  if (raw.startsWith("'") && raw.endsWith("'")) raw = raw.slice(1, -1);
+  let raw = cleanEnv(process.env.FIREBASE_SERVICE_ACCOUNT);
   const sa = JSON.parse(raw);
   sa.private_key = sa.private_key.replace(/\\n/g, '\n');
   initializeApp({ credential: cert(sa) });
