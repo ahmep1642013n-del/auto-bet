@@ -1,0 +1,75 @@
+name: SX Bet Auto-Bettor (Cloudflare WARP)
+
+on:
+  workflow_dispatch: # تشغيل يدوي في أي وقت
+  schedule:
+    - cron: '0 */5 * * *' # إعادة تشغيل كل 5 ساعات لضمان الاستمرارية
+  push:
+    branches: [ main ]
+
+concurrency:
+  group: sx-bet-daemon
+  cancel-in-progress: true # إلغاء الدورة السابقة لتشغيل دورة واحدة فقط دائماً بدون تكرار
+
+permissions:
+  actions: write
+  contents: write
+
+jobs:
+  auto-bet:
+    runs-on: ubuntu-latest
+    timeout-minutes: 340 # يعمل لمدة 5 ساعات و 40 دقيقة (قبل حد جيتهاب الأقصى 6 ساعات)
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: 'npm'
+
+      - name: Install Dependencies
+        run: npm install
+
+      - name: Install and Connect Cloudflare WARP
+        run: |
+          echo "=== 1. Installing Cloudflare WARP ==="
+          curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg | sudo gpg --yes --dearmor --output /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg
+          echo "deb [arch=amd64 signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] https://pkg.cloudflareclient.com/ $(lsb_release -cs) main" | sudo tee /etc/apt/sources.list.d/cloudflare-client.list
+          sudo apt-get update
+          sudo apt-get install -y cloudflare-warp
+
+          echo "=== 2. Starting WARP Service ==="
+          sudo systemctl start warp-svc
+          sleep 2
+
+          echo "=== 3. Registering & Connecting to Cloudflare ==="
+          sudo warp-cli --accept-tos registration new || true
+          sudo warp-cli --accept-tos connect
+          sleep 4
+
+          echo "=== 4. Verifying Cloudflare Connection ==="
+          sudo warp-cli --accept-tos status
+          echo "--- Cloudflare Trace (IP Verification) ---"
+          curl -s https://cloudflare.com/cdn-cgi/trace
+
+      - name: Run Auto-Bet Daemon
+        env:
+          sx_bet_API: ${{ secrets.SX_BET_API || secrets.sx_bet_API }}
+          PRIVATE_KEY: ${{ secrets.PRIVATE_KEY }}
+          FIREBASE_SERVICE_ACCOUNT: ${{ secrets.FIREBASE_SERVICE_ACCOUNT }}
+          MONGODB_URI: ${{ secrets.MONGODB_URI }}
+        run: |
+          echo "=== Running SX Bet Bot Daemon ==="
+          node auto-bet.mjs
+
+      - name: Self-Trigger Next Run (24/7 Forever Loop)
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          echo "=== Dispatching next 24/7 workflow run ==="
+          gh workflow run auto-bet.yml --ref ${{ github.ref_name }} || true
+
