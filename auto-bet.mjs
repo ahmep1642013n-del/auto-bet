@@ -35,6 +35,8 @@ import { Wallet, hexlify, randomBytes } from 'ethers';
 import { readFileSync, writeFileSync, existsSync } from 'fs';
 import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
+import nodeFetch from 'node-fetch';
+import { HttpsProxyAgent } from 'https-proxy-agent';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -59,6 +61,47 @@ const SX_PRIVATE_KEY = cleanEnv(process.env.PRIVATE_KEY);
 const FETCH_TIMEOUT_MS = 15_000;
 const MAX_SEARCH_RETRIES = 6; // Max times to retry "match not found" before giving up (6 × 10min = 1 hour)
 const BET_LOG_FILE = join(__dirname, 'bet-history.json');
+
+// ═══════════════════════════════════════════════
+//  PROXY ROTATION FOR ORDER EXECUTION (Webshare)
+// ═══════════════════════════════════════════════
+const DEFAULT_PROXIES = [
+  'http://bivwqmnj:6pssg3eaa1rx@64.137.10.153:5803', // Germany (Frankfurt)
+  'http://bivwqmnj:6pssg3eaa1rx@45.38.107.97:6014',  // United Kingdom (London)
+  'http://bivwqmnj:6pssg3eaa1rx@64.137.96.74:6641',  // Spain (Madrid)
+  'http://bivwqmnj:6pssg3eaa1rx@84.247.60.125:6095', // Poland (Warsaw)
+];
+
+function getProxies() {
+  const custom = cleanEnv(process.env.PROXY_URL || process.env.WEBSHARE_PROXY);
+  if (custom) return [custom];
+  const file = join(__dirname, 'Webshare 10 proxies.txt');
+  if (existsSync(file)) {
+    try {
+      const lines = readFileSync(file, 'utf-8').split('\n').map(l => l.trim()).filter(Boolean);
+      const parsed = lines.map(line => {
+        const parts = line.split(':');
+        if (parts.length === 4) {
+          const [ip, port, user, pass] = parts;
+          return `http://${user}:${pass}@${ip}:${port}`;
+        }
+        return line.startsWith('http') ? line : `http://${line}`;
+      });
+      // Prioritize allowed European jurisdictions (Germany, UK, Spain, Poland)
+      const euroOrder = ['64.137.10.153', '45.38.107.97', '64.137.96.74', '84.247.60.125'];
+      parsed.sort((a, b) => {
+        const aIndex = euroOrder.findIndex(ip => a.includes(ip));
+        const bIndex = euroOrder.findIndex(ip => b.includes(ip));
+        if (aIndex !== -1 && bIndex !== -1) return aIndex - bIndex;
+        if (aIndex !== -1) return -1;
+        if (bIndex !== -1) return 1;
+        return 0;
+      });
+      if (parsed.length) return parsed;
+    } catch {}
+  }
+  return DEFAULT_PROXIES;
+}
 
 // ═══════════════════════════════════════════════
 //  LOGGER
@@ -328,9 +371,46 @@ async function sxGet(path, params = {}, auth = false, retries = 1) {
 }
 
 async function sxPost(path, body) {
-  const res = await fetchWithTimeout(new URL(path, SX_API_BASE), {
+  const url = new URL(path, SX_API_BASE).toString();
+  const headers = { 'Content-Type': 'application/json', 'x-sx-api-key': SX_API_KEY };
+  const proxies = getProxies();
+
+  // Route POST orders through European residential/datacenter proxy to avoid 403 Forbidden
+  for (let i = 0; i < proxies.length; i++) {
+    const proxyUrl = proxies[i];
+    const proxyHost = proxyUrl.split('@')[1] || proxyUrl;
+    try {
+      log('🌐', `Routing POST ${path} through proxy #${i + 1} (${proxyHost})...`);
+      const agent = new HttpsProxyAgent(proxyUrl);
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
+      const res = await nodeFetch(url, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify(body),
+        agent,
+        signal: controller.signal,
+      }).finally(() => clearTimeout(timer));
+
+      if (!res.ok) {
+        const errText = await res.text();
+        throw new Error(`SX POST ${path} -> ${res.status}: ${errText}`);
+      }
+      return await res.json();
+    } catch (err) {
+      log('⚠️', `Proxy #${i + 1} attempt error: ${err.message}`);
+      if (i < proxies.length - 1) {
+        log('🔄', `Failover to next proxy...`);
+        await sleep(1000);
+      }
+    }
+  }
+
+  // Last-resort fallback: attempt direct connection
+  log('⚠️', `All proxies exhausted, trying direct connection as fallback...`);
+  const res = await fetchWithTimeout(url, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json', 'x-sx-api-key': SX_API_KEY },
+    headers,
     body: JSON.stringify(body),
   });
   if (!res.ok) throw new Error(`SX POST ${path} -> ${res.status}: ${await res.text()}`);
