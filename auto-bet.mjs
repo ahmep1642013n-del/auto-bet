@@ -438,14 +438,25 @@ async function getBalance() {
 // ═══════════════════════════════════════════════
 function normalise(s) { return s.toLowerCase().replace(/[^a-z0-9 ]/g, ' ').replace(/\s+/g, ' ').trim(); }
 
+const COMMON_PREFIXES = new Set(['fc', 'sk', 'ac', 'as', 'cf', 'sc', 'cd', 'afk', 'fk', 'bk', 'de', 'la', 'el', 'al', 'cp']);
+
 function teamsMatch(sxTeam, dbTeam) {
   const a = normalise(sxTeam);
   const b = normalise(dbTeam);
   if (a === b) return true;
   if (a.includes(b) || b.includes(a)) return true;
-  const wa = a.split(' ')[0];
-  const wb = b.split(' ')[0];
-  if (wa.length >= 3 && wb.length >= 3 && (wa.includes(wb) || wb.includes(wa))) return true;
+
+  // Split into significant words (excluding short prefixes like SK, FC, AC)
+  const wordsA = a.split(' ').filter(w => w.length >= 3 && !COMMON_PREFIXES.has(w));
+  const wordsB = b.split(' ').filter(w => w.length >= 3 && !COMMON_PREFIXES.has(w));
+
+  for (const wa of wordsA) {
+    for (const wb of wordsB) {
+      if (wa === wb) return true;
+      if (wa.length >= 4 && wb.length >= 4 && (wa.includes(wb) || wb.includes(wa))) return true;
+    }
+  }
+
   return false;
 }
 
