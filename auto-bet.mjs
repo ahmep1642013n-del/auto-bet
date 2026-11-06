@@ -157,6 +157,7 @@ async function loadBetHistory(col) {
     if (doc) {
       return {
         bets: Array.isArray(doc.bets) ? doc.bets : [],
+        events: Array.isArray(doc.events) ? doc.events : [],
         dailySpend: doc.dailySpend || {},
         searchRetries: doc.searchRetries || {},
         lastCleanup: doc.lastCleanup || ''
@@ -165,7 +166,7 @@ async function loadBetHistory(col) {
   } catch (e) {
     log('⚠️', `Failed to load history from Mongo: ${e.message}`);
   }
-  return { bets: [], dailySpend: {}, lastCleanup: '', searchRetries: {} };
+  return { bets: [], events: [], dailySpend: {}, lastCleanup: '', searchRetries: {} };
 }
 
 async function saveBetHistory(col, history) {
@@ -175,6 +176,7 @@ async function saveBetHistory(col, history) {
       {
         $set: {
           bets: history.bets,
+          events: history.events || [],
           dailySpend: history.dailySpend,
           searchRetries: history.searchRetries,
           lastCleanup: history.lastCleanup,
@@ -196,9 +198,14 @@ function wasBetPlaced(history, key) {
   return history.bets.includes(key);
 }
 
-async function recordBet(col, history, key, amount) {
-  if (!history.bets.includes(key)) {
+async function recordBet(col, history, key, amount, eventId = null) {
+  if (key && !history.bets.includes(key)) {
     history.bets.push(key);
+  }
+  if (!history.events) history.events = [];
+  if (eventId && !history.events.includes(eventId)) {
+    history.events.push(eventId);
+    log('📌', `Recorded Event ID ${eventId} to prevent duplicate bets`);
   }
   const today = new Date().toISOString().split('T')[0];
   history.dailySpend[today] = (history.dailySpend[today] || 0) + amount;
@@ -210,6 +217,10 @@ async function recordBet(col, history, key, amount) {
     history.bets = history.bets.filter(b => b >= cutoffStr);
     for (const d of Object.keys(history.dailySpend)) {
       if (d < cutoffStr) delete history.dailySpend[d];
+    }
+    // Limit event IDs history length
+    if (history.events.length > 200) {
+      history.events = history.events.slice(-100);
     }
     history.lastCleanup = today;
   }
@@ -698,34 +709,72 @@ function calcBetSize(balance, confidence) {
 }
 
 // ═══════════════════════════════════════════════
+//  TRAILING ODDS TRACKER (In-Memory Peak Following)
+// ═══════════════════════════════════════════════
+// State is kept in-memory so each 6-hour runner session starts clean
+// without persisting unplaced/tracking bets to MongoDB.
+const oddsTracker = new Map(); // eventId -> { peakOdds, lastOdds, checksCount, firstSeenAt }
+const KICKOFF_URGENT_MINUTES = 30; // Place bet immediately if match starts in <= 30 mins
+const DROP_TRIGGER_DIFF = 0.01;    // Minimum drop from peak (0.01) to trigger execution
+const betFailures = new Map();     // betKey -> failure count
+
+function getMinutesToKickoff(fixture) {
+  if (!fixture?.gameTime) return 999;
+  const kickoffMs = new Date(fixture.gameTime).getTime();
+  if (isNaN(kickoffMs)) return 999;
+  return (kickoffMs - Date.now()) / (60 * 1000);
+}
+
+async function getOrderbookTop(market, isOutcomeOne) {
+  try {
+    const { data: book } = await sxGet('/orderbook-v3/snapshot/market', {
+      marketHash: market.marketHash,
+      showTakerPerspective: true,
+    }, true);
+
+    const levels = isOutcomeOne ? book?.outcomeOne : book?.outcomeTwo;
+    if (!levels?.length) return null;
+
+    const best = levels[0];
+    const percentageOdds = best.percentageOdds;
+    const prob = Number(BigInt(percentageOdds)) / 1e18;
+    const decimalOdds = prob > 0 ? Number((100 / prob).toFixed(2)) : 0;
+    const availableSize = BigInt(best.size);
+
+    return {
+      best,
+      percentageOdds,
+      prob,
+      decimalOdds,
+      availableSize,
+    };
+  } catch (e) {
+    log('⚠️', `Orderbook snapshot error: ${e.message}`);
+    return null;
+  }
+}
+
+// ═══════════════════════════════════════════════
 //  PLACE BET
 // ═══════════════════════════════════════════════
-async function placeBet(wallet, market, isOutcomeOne, betSize) {
+async function placeBet(wallet, market, isOutcomeOne, betSize, orderbookTop = null) {
   // 1) Metadata
   const { data: meta } = await sxGet('/metadata/obv3');
 
-  // 2) Orderbook (taker perspective)
-  const { data: book } = await sxGet('/orderbook-v3/snapshot/market', {
-    marketHash: market.marketHash,
-    showTakerPerspective: true,
-  }, true);
+  // 2) Orderbook top (use cached or fetch fresh)
+  const top = orderbookTop || await getOrderbookTop(market, isOutcomeOne);
+  if (!top) throw new Error('No liquidity available');
 
-  const levels = isOutcomeOne ? book.outcomeOne : book.outcomeTwo;
-  if (!levels?.length) throw new Error('No liquidity available');
-
-  const best = levels[0];
-  const percentageOdds = best.percentageOdds;
-  const availableSize = BigInt(best.size);
+  const { percentageOdds, availableSize, prob, decimalOdds } = top;
   const actualBet = betSize < availableSize ? betSize : availableSize;
 
   if (actualBet < 1_000_000n) throw new Error(`Bet size too small: ${Number(actualBet) / 1e6} USDC`);
 
-  const oddsDisplay = (Number(BigInt(percentageOdds)) / 1e18).toFixed(2);
-  log('📈', `Best price: ${oddsDisplay}% | Liquidity: ${Number(availableSize) / 1e6} USDC | Bet: ${Number(actualBet) / 1e6} USDC`);
+  log('📈', `Executing order: ${prob.toFixed(2)}% (Odds: ${decimalOdds}) | Liquidity: ${Number(availableSize) / 1e6} USDC | Bet: ${Number(actualBet) / 1e6} USDC`);
 
   if (DRY_RUN) {
     log('🧪', '<-- DRY RUN -- bet NOT placed');
-    return { dryRun: true, bet: Number(actualBet) / 1e6, odds: oddsDisplay };
+    return { dryRun: true, bet: Number(actualBet) / 1e6, odds: decimalOdds };
   }
 
   // 3) Build order
@@ -864,6 +913,13 @@ async function runCycle(db, wallet, col) {
       continue;
     }
 
+    // 🛡️ SX Bet Event ID Deduplication: If this exact event was already bet on, NEVER bet again!
+    if (history.events && history.events.includes(fixture.eventId)) {
+      log('🛑', `Already placed a bet on this match on SX Bet (Event ID: ${fixture.eventId}) -- skipping duplicate!`);
+      results.push({ ...p, status: 'SKIP', reason: `Event ${fixture.eventId} already bet` });
+      continue;
+    }
+
     // -- Find market --
     let market = await findMarket(fixture.eventId, cls, fixture.type || []);
 
@@ -893,9 +949,74 @@ async function runCycle(db, wallet, col) {
     }
     log('🎲', `Betting on: ${dir.label}`);
 
+    // -- Check kickoff time --
+    const minsToKickoff = getMinutesToKickoff(fixture);
+    if (minsToKickoff < -15) {
+      log('⏰', 'Match kicked off >15m ago -- skipping');
+      await recordBet(col, history, betKey, 0);
+      results.push({ ...p, status: 'SKIP', reason: 'Match already kicked off' });
+      continue;
+    }
+
+    // -- Fetch current orderbook price & liquidity --
+    const top = await getOrderbookTop(market, dir.outcomeOne);
+    if (!top) {
+      log('⏳', 'No liquidity on SX Bet orderbook yet -- waiting for next cycle');
+      results.push({ ...p, status: 'WAIT', reason: 'No liquidity yet' });
+      continue; // Intentionally NO recordBet, keeps MongoDB clean for next check
+    }
+
+    // -- Trailing Odds Peak-Tracking Logic --
+    const curOdds = top.decimalOdds;
+    let shouldBetNow = false;
+    let triggerReason = '';
+
+    if (minsToKickoff <= KICKOFF_URGENT_MINUTES && minsToKickoff >= -15) {
+      shouldBetNow = true;
+      triggerReason = `Kickoff in ${Math.round(minsToKickoff)}m (<= ${KICKOFF_URGENT_MINUTES}m urgency cutoff)`;
+    } else {
+      const tracker = oddsTracker.get(fixture.eventId);
+      if (!tracker) {
+        // First time seeing this fixture: start tracking and wait for price movement!
+        oddsTracker.set(fixture.eventId, {
+          peakOdds: curOdds,
+          lastOdds: curOdds,
+          checksCount: 1,
+          firstSeenAt: Date.now(),
+        });
+        log('👀', `Started tracking #${p.matchIndex} (${p.team1} vs ${p.team2})`);
+        log('📊', `Current Odds: ${curOdds} | Kickoff in: ${Math.round(minsToKickoff)}m -- Waiting for next cycle to check for increase`);
+        results.push({ ...p, status: 'WAIT', reason: `Tracking started @ ${curOdds}` });
+        continue; // Intentionally NO recordBet in DB, leaving state completely clean!
+      }
+
+      tracker.checksCount++;
+      const prevPeak = tracker.peakOdds;
+      const prevLast = tracker.lastOdds;
+
+      if (curOdds > prevPeak) {
+        // Odds increased! Update peak and hold bet to catch higher odds
+        tracker.peakOdds = curOdds;
+        tracker.lastOdds = curOdds;
+        log('📈', `Odds INCREASED: ${prevPeak} -> ${curOdds} (New Peak! 🔥)`);
+        log('⏳', `Holding bet to catch higher odds... (${Math.round(minsToKickoff)}m to kickoff, check #${tracker.checksCount})`);
+        results.push({ ...p, status: 'WAIT', reason: `Odds rising: ${prevPeak} -> ${curOdds}` });
+        continue; // Intentionally NO recordBet in DB!
+      } else if (curOdds >= prevPeak - (DROP_TRIGGER_DIFF - 0.001)) {
+        // Odds steady (within 0.01 noise margin)
+        tracker.lastOdds = curOdds;
+        log('⏳', `Odds steady at ${curOdds} (Peak: ${prevPeak}) -- waiting for movement (${Math.round(minsToKickoff)}m to kickoff, check #${tracker.checksCount})`);
+        results.push({ ...p, status: 'WAIT', reason: `Odds steady @ ${curOdds}` });
+        continue; // Intentionally NO recordBet in DB!
+      } else {
+        // Odds dropped from peak by at least 0.01! The peak has crested -> lock in high odds!
+        shouldBetNow = true;
+        triggerReason = `Odds dropped from peak ${prevPeak} to ${curOdds} (-${(prevPeak - curOdds).toFixed(2)}) -- locking in high odds!`;
+      }
+    }
+
     // -- Re-read balance & check safety limits --
     const { available: curBal } = await getBalance();
-
     const bettableBalance = curBal;
     let betSize = calcBetSize(bettableBalance, p.confidence);
 
@@ -909,22 +1030,27 @@ async function runCycle(db, wallet, col) {
       continue;
     }
 
-
-
     const pctLabel = p.confidence >= 85 ? '25%' : p.confidence >= 80 ? '15%' : '10%';
     log('💵', `Bet size: ${Number(betSize) / 1e6} USDC (${pctLabel} of bettable balance)`);
+    log('🎯', `TRIGGER: ${triggerReason}`);
 
     // -- Place bet --
     try {
-      const res = await placeBet(wallet, market, dir.outcomeOne, betSize);
+      const res = await placeBet(wallet, market, dir.outcomeOne, betSize, top);
       log('✅', 'Bet placed successfully!');
       if (!DRY_RUN) log('📝', JSON.stringify(res, null, 2));
-      await recordBet(col, history, betKey, Number(betSize) / 1e6);
+      await recordBet(col, history, betKey, Number(betSize) / 1e6, fixture.eventId);
+      oddsTracker.delete(fixture.eventId); // Done tracking
       betsPlaced++;
       results.push({ ...p, status: 'OK', result: res });
     } catch (err) {
       log('❌', `Bet failed: ${err.message}`);
-      await recordBet(col, history, betKey, 0);
+      const failCount = (betFailures.get(betKey) || 0) + 1;
+      betFailures.set(betKey, failCount);
+      if (failCount >= 3) {
+        log('🛑', 'Bet failed 3 times -- recording as finished to prevent endless retries');
+        await recordBet(col, history, betKey, 0);
+      }
       results.push({ ...p, status: 'FAIL', reason: err.message });
     }
 
@@ -937,7 +1063,7 @@ async function runCycle(db, wallet, col) {
     console.log('\n' + '='.repeat(60));
     log('📊', '== Cycle Results ==');
     for (const r of results) {
-      const icon = r.status === 'OK' ? '✅' : r.status === 'FAIL' ? '❌' : '⏭️';
+      const icon = r.status === 'OK' ? '✅' : r.status === 'FAIL' ? '❌' : r.status === 'WAIT' ? '⏳' : '⏭️';
       log(icon, `#${r.matchIndex}  ${r.team1} vs ${r.team2}  ->  ${r.status}${r.reason ? '  (' + r.reason + ')' : ''}`);
     }
     log('💰', `Bets placed this cycle: ${betsPlaced}`);
@@ -973,7 +1099,7 @@ async function main() {
   if (RUN_ONCE) {
     await runCycle(db, wallet, mongoCol);
     log('🏁', 'Done!');
-    return;
+    process.exit(0);
   }
 
   // Daemon loop
