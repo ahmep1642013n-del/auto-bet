@@ -523,7 +523,9 @@ async function findMarket(eventId, classification, availableTypes) {
 
   switch (classification.type) {
     case 'moneyline':
-      targetTypes = [MARKET_TYPES.MONEYLINE_NO_DRAW, MARKET_TYPES.MONEYLINE_OT];
+      // For straight wins, prioritize 1X2 markets (Type 1 and 14).
+      // Fallback to Moneyline No Draw (52) for 2-way sports without draws (e.g. Tennis, Basketball).
+      targetTypes = [MARKET_TYPES.ONE_X_TWO_1, MARKET_TYPES.ONE_X_TWO_2, MARKET_TYPES.MONEYLINE_NO_DRAW, MARKET_TYPES.MONEYLINE_OT];
       break;
     case 'over_under':
     case 'team_over':
@@ -555,8 +557,8 @@ async function findMarket(eventId, classification, availableTypes) {
 
   for (const mtype of valid) {
     try {
-      // For over/under and handicap we need ALL lines (not just main), so skip onlyMainLine
-      const needAllLines = classification.type === 'over_under' || classification.type === 'team_over' || classification.type === 'handicap';
+      // For over/under, handicap, and 1X2 (types 1, 14) we need ALL lines (not just main), so skip onlyMainLine
+      const needAllLines = classification.type === 'over_under' || classification.type === 'team_over' || classification.type === 'handicap' || mtype === MARKET_TYPES.ONE_X_TWO_1 || mtype === MARKET_TYPES.ONE_X_TWO_2;
       const params = { eventId, type: mtype };
       if (!needAllLines) params.onlyMainLine = true;
       const r = await sxGet('/markets/active', params);
@@ -609,8 +611,25 @@ async function findMarket(eventId, classification, availableTypes) {
           }
         }
         log('⚠️', `Could not find opponent "${opp}" in 1X2 markets`);
+      } else if (classification.type === 'moneyline') {
+        // Straight Win (1X2): find the market where outcomeOne is this team (e.g. "Real Madrid / Not Real Madrid")
+        const team = classification.team;
+        for (const m of markets) {
+          if (teamsMatch(m.outcomeOneName, team)) {
+            log('✅', `1X2 Straight Win market found: ${m.outcomeOneName} / ${m.outcomeTwoName}`);
+            return m;
+          }
+        }
+        // Fallback for 2-way sports (e.g. "Team1 / Team2" in tennis/basketball)
+        for (const m of markets) {
+          if (teamsMatch(m.outcomeOneName, team) || teamsMatch(m.outcomeTwoName, team)) {
+            log('✅', `Market found: ${m.outcomeOneName} / ${m.outcomeTwoName}`);
+            return m;
+          }
+        }
+        log('⚠️', `Could not find market for "${team}" in type ${mtype}`);
       } else {
-        // moneyline / BTTS → return first
+        // BTTS → return first
         log('✅', `Market: ${markets[0].outcomeOneName} / ${markets[0].outcomeTwoName}`);
         return markets[0];
       }
