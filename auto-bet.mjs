@@ -331,8 +331,15 @@ function classifyPrediction(prediction) {
   const tm = p.match(totalRe);
   if (tm) return { type: 'over_under', line: parseFloat(tm[2]), side: tm[1].toLowerCase() };
 
-  if (/both\s*team/i.test(p) && /yes/i.test(p)) {
-    return { type: 'btts' };
+  // Both Teams To Score: Yes vs No
+  if (/(?:both\s*teams?\s*(?:to\s*)?score|btts)/i.test(p)) {
+    if (/\bno\b/i.test(p)) {
+      return { type: 'btts_no' };
+    }
+    if (/\byes\b/i.test(p)) {
+      return { type: 'btts_yes' };
+    }
+    return { type: 'unknown', raw: p };
   }
 
   // "Leverkusen Over 1.5 Goals" or "Leverkusen Under 1.5 Goals" → team-specific
@@ -532,6 +539,7 @@ async function findMarket(eventId, classification, availableTypes) {
       targetTypes = [MARKET_TYPES.OVER_UNDER, MARKET_TYPES.OVER_UNDER_OT];
       break;
     case 'btts':
+    case 'btts_yes':
       targetTypes = [MARKET_TYPES.BTTS];
       break;
     case 'double_chance':
@@ -566,19 +574,13 @@ async function findMarket(eventId, classification, availableTypes) {
       if (!markets.length) continue;
 
       if (classification.type === 'over_under') {
-        // Match total over/under — try exact line first, then closest ±0.5
+        // Match total over/under — STRICT exact line only (NO risky fallbacks)
         const exact = markets.find(m => m.line === classification.line);
         if (exact) {
           log('✅', `Market: ${exact.outcomeOneName} / ${exact.outcomeTwoName} (line ${exact.line})`);
           return exact;
         }
-        const closest = markets.reduce((a, b) =>
-          Math.abs(b.line - classification.line) < Math.abs(a.line - classification.line) ? b : a
-        );
-        if (Math.abs(closest.line - classification.line) <= 0.5) {
-          log('⚠️', `Line ${classification.line} not found, closest: ${closest.line}`);
-          return closest;
-        }
+        log('⚠️', `Exact line ${classification.line} not available on SX Bet — skipping to prevent high-risk lines`);
       } else if (classification.type === 'team_over') {
         // Team-specific over (e.g. "Leverkusen Over 1.5 Goals")
         // Search for exact line in match total (line MUST stay the same)
@@ -689,12 +691,13 @@ function determineBetDirection(market, classification) {
       }
     }
 
-    case 'btts': {
+    case 'btts':
+    case 'btts_yes': {
       const o1 = market.outcomeOneName.toLowerCase();
       if (o1.includes('yes') || !o1.includes('no')) {
-        return { outcomeOne: true, label: market.outcomeOneName + ' (BTTS)' };
+        return { outcomeOne: true, label: market.outcomeOneName + ' (BTTS Yes)' };
       }
-      return { outcomeOne: false, label: market.outcomeTwoName + ' (BTTS)' };
+      return { outcomeOne: false, label: market.outcomeTwoName + ' (BTTS Yes)' };
     }
 
     case 'handicap': {
@@ -894,6 +897,12 @@ async function runCycle(db, wallet, col) {
 
     // -- Classify --
     const cls = classifyPrediction(p.prediction);
+    if (cls.type === 'btts_no') {
+      log('⏭️', `Skip -- "Both Teams To Score No" is not supported on SX Bet`);
+      await recordBet(col, history, betKey, 0);
+      results.push({ ...p, status: 'SKIP', reason: 'BTTS No not supported on SX Bet' });
+      continue;
+    }
     if (cls.type === 'unknown') {
       log('⚠️', `Cannot classify prediction: "${p.prediction}"`);
       await recordBet(col, history, betKey, 0);
@@ -942,10 +951,10 @@ async function runCycle(db, wallet, col) {
     // -- Find market --
     let market = await findMarket(fixture.eventId, cls, fixture.type || []);
 
-    // BTTS fallback: if BTTS market (type 17) is unavailable, convert to Over 1.5
+    // BTTS fallback: if BTTS Yes market (type 17) is unavailable, convert to Over 1.5 ONLY for "Both Team Score Yes"
     // Logic: Both teams scoring = at least 2 goals = Over 1.5 (same idea, lower risk)
-    if (!market && cls.type === 'btts') {
-      log('🔄', 'BTTS market unavailable — converting to Over 1.5 Goals (same logic, lower risk)');
+    if (!market && (cls.type === 'btts' || cls.type === 'btts_yes')) {
+      log('🔄', 'BTTS Yes market unavailable — converting to Over 1.5 Goals (same logic, lower risk)');
       cls.type = 'over_under';
       cls.line = 1.5;
       cls.side = 'over';
