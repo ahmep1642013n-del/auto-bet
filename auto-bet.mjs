@@ -456,22 +456,52 @@ async function getBalance() {
 // ═══════════════════════════════════════════════
 function normalise(s) { return s.toLowerCase().replace(/[^a-z0-9 ]/g, ' ').replace(/\s+/g, ' ').trim(); }
 
-const COMMON_PREFIXES = new Set(['fc', 'sk', 'ac', 'as', 'cf', 'sc', 'cd', 'afk', 'fk', 'bk', 'de', 'la', 'el', 'al', 'cp']);
+const GENERIC_WORDS = new Set([
+  'fc', 'sk', 'ac', 'as', 'cf', 'sc', 'cd', 'afk', 'fk', 'bk', 'de', 'la', 'el', 'al', 'cp', 'ik',
+  'city', 'inter', 'united', 'town', 'real', 'athletic', 'sporting', 'rovers', 'wanderers',
+  'dynamo', 'dinamo', 'lokomotiv', 'racing', 'atletico', 'club', 'clube', 'sports',
+  'women', 'ladies', 'lfc', 'wfc', 'femmes', 'frauen', 'w',
+  'u19', 'u20', 'u21', 'u23', 'reserves', 'youth', 'amateur'
+]);
+
+function getSignificantWords(name) {
+  return normalise(name)
+    .split(' ')
+    .filter(w => w.length >= 3 && !GENERIC_WORDS.has(w));
+}
+
+function isSpecialCategory(name) {
+  const n = ' ' + normalise(name) + ' ';
+  return /\b(women|ladies|lfc w|wfc|w|u19|u20|u21|u23|reserves|youth)\b/i.test(n);
+}
 
 function teamsMatch(sxTeam, dbTeam) {
   const a = normalise(sxTeam);
   const b = normalise(dbTeam);
   if (a === b) return true;
-  if (a.includes(b) || b.includes(a)) return true;
 
-  // Split into significant words (excluding short prefixes like SK, FC, AC)
-  const wordsA = a.split(' ').filter(w => w.length >= 3 && !COMMON_PREFIXES.has(w));
-  const wordsB = b.split(' ').filter(w => w.length >= 3 && !COMMON_PREFIXES.has(w));
+  // Protect against gender / youth mismatch (e.g. Women vs Men's match, U19 vs Senior)
+  const aSpecial = isSpecialCategory(sxTeam);
+  const bSpecial = isSpecialCategory(dbTeam);
+  if (aSpecial !== bSpecial) {
+    return false;
+  }
 
-  for (const wa of wordsA) {
-    for (const wb of wordsB) {
+  const sigA = getSignificantWords(a);
+  const sigB = getSignificantWords(b);
+
+  // If neither has significant words (all generic words), require exact match
+  if (!sigA.length || !sigB.length) {
+    return a === b;
+  }
+
+  // Must match on at least one significant non-generic word
+  for (const wa of sigA) {
+    for (const wb of sigB) {
       if (wa === wb) return true;
-      if (wa.length >= 4 && wb.length >= 4 && (wa.includes(wb) || wb.includes(wa))) return true;
+      if (wa.length >= 4 && wb.length >= 4 && (wa.includes(wb) || wb.includes(wa))) {
+        return true;
+      }
     }
   }
 
@@ -482,12 +512,10 @@ async function searchFixture(team1, team2) {
   const terms = new Set();
   if (team1.length >= 3) terms.add(team1);
   if (team2.length >= 3) terms.add(team2);
-  const w1 = team1.split(' ')[0]; if (w1.length >= 3) terms.add(w1);
-  const w2 = team2.split(' ')[0]; if (w2.length >= 3) terms.add(w2);
-  const c1 = team1.replace(/[^a-zA-Z0-9 ]/g, '').trim();
-  const c2 = team2.replace(/[^a-zA-Z0-9 ]/g, '').trim();
-  if (c1.length >= 3) terms.add(c1);
-  if (c2.length >= 3) terms.add(c2);
+
+  // Only search by significant distinctive words — NEVER search generic words like "Inter", "City", "United"
+  for (const w of getSignificantWords(team1)) terms.add(w);
+  for (const w of getSignificantWords(team2)) terms.add(w);
 
   for (const q of terms) {
     try {
@@ -909,6 +937,19 @@ async function runCycle(db, wallet, col) {
       results.push({ ...p, status: 'SKIP', reason: 'Unknown prediction type' });
       continue;
     }
+
+    // Resolve short prediction team names (e.g. "City" -> "Ikorodu City") to prevent matching wrong teams
+    if (cls.team) {
+      const nTeam = normalise(cls.team);
+      const n1 = normalise(p.team1);
+      const n2 = normalise(p.team2);
+      if (n1 === nTeam || n1.split(' ').includes(nTeam)) {
+        cls.team = p.team1;
+      } else if (n2 === nTeam || n2.split(' ').includes(nTeam)) {
+        cls.team = p.team2;
+      }
+    }
+
     log('🎯', `Type: ${cls.type}`, cls.team ? `| Team: ${cls.team}` : '', cls.line != null ? `| Line: ${cls.line}` : '', cls.side ? `| Side: ${cls.side}` : '');
 
     // For double_chance, figure out the opponent
