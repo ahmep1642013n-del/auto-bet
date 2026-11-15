@@ -98,7 +98,7 @@ function getProxies() {
         return 0;
       });
       if (parsed.length) return parsed;
-    } catch {}
+    } catch { }
   }
   return DEFAULT_PROXIES;
 }
@@ -766,6 +766,8 @@ function calcBetSize(balance, confidence) {
 const oddsTracker = new Map(); // eventId -> { peakOdds, lastOdds, checksCount, firstSeenAt }
 const KICKOFF_URGENT_MINUTES = 30; // Place bet immediately if match starts in <= 30 mins
 const DROP_TRIGGER_DIFF = 0.01;    // Minimum drop from peak (0.01) to trigger execution
+const MIN_ODDS_THRESHOLD = 1.15;   // If odds < 1.15, refuse to bet unless confidence >= 85%
+const MIN_CONFIDENCE_FOR_LOW_ODDS = 85;
 const betFailures = new Map();     // betKey -> failure count
 
 function getMinutesToKickoff(fixture) {
@@ -1041,6 +1043,15 @@ async function runCycle(db, wallet, col) {
     let triggerReason = '';
 
     if (minsToKickoff <= KICKOFF_URGENT_MINUTES && minsToKickoff >= -15) {
+      // Mandatory cutoff (<= 30m before kickoff)
+      // Safety filter: Refuse to place bet if odds < 1.15 unless confidence is 85%+
+      if (curOdds < MIN_ODDS_THRESHOLD && p.confidence < MIN_CONFIDENCE_FOR_LOW_ODDS) {
+        log('🛑', `Rejected at cutoff: Odds ${curOdds} < ${MIN_ODDS_THRESHOLD} and confidence ${p.confidence}% < ${MIN_CONFIDENCE_FOR_LOW_ODDS}% -- skipping bet to protect bankroll!`);
+        await recordBet(col, history, betKey, 0);
+        oddsTracker.delete(fixture.eventId);
+        results.push({ ...p, status: 'SKIP', reason: `Odds ${curOdds} < ${MIN_ODDS_THRESHOLD} & Conf ${p.confidence}% < ${MIN_CONFIDENCE_FOR_LOW_ODDS}%` });
+        continue;
+      }
       shouldBetNow = true;
       triggerReason = `Kickoff in ${Math.round(minsToKickoff)}m (<= ${KICKOFF_URGENT_MINUTES}m urgency cutoff)`;
     } else {
@@ -1079,6 +1090,13 @@ async function runCycle(db, wallet, col) {
         continue; // Intentionally NO recordBet in DB!
       } else {
         // Odds dropped from peak by at least 0.01! The peak has crested -> lock in high odds!
+        // But refuse to place bet if odds are below minimum threshold (1.15) and confidence < 85%
+        if (curOdds < MIN_ODDS_THRESHOLD && p.confidence < MIN_CONFIDENCE_FOR_LOW_ODDS) {
+          tracker.lastOdds = curOdds;
+          log('⏳', `Odds dropped (${prevPeak} -> ${curOdds}), but odds < ${MIN_ODDS_THRESHOLD} and confidence ${p.confidence}% < ${MIN_CONFIDENCE_FOR_LOW_ODDS}% -- holding to see if odds recover before kickoff (${Math.round(minsToKickoff)}m to kickoff)`);
+          results.push({ ...p, status: 'WAIT', reason: `Odds ${curOdds} < ${MIN_ODDS_THRESHOLD} (Conf ${p.confidence}% < ${MIN_CONFIDENCE_FOR_LOW_ODDS}%)` });
+          continue;
+        }
         shouldBetNow = true;
         triggerReason = `Odds dropped from peak ${prevPeak} to ${curOdds} (-${(prevPeak - curOdds).toFixed(2)}) -- locking in high odds!`;
       }
@@ -1102,6 +1120,15 @@ async function runCycle(db, wallet, col) {
     const pctLabel = p.confidence >= 85 ? '25%' : p.confidence >= 80 ? '15%' : '10%';
     log('💵', `Bet size: ${Number(betSize) / 1e6} USDC (${pctLabel} of bettable balance)`);
     log('🎯', `TRIGGER: ${triggerReason}`);
+
+    // Final safety check: Never place bet if odds < 1.15 unless confidence >= 85%
+    if (curOdds < MIN_ODDS_THRESHOLD && p.confidence < MIN_CONFIDENCE_FOR_LOW_ODDS) {
+      log('🛑', `Safety abort: Bet blocked because Odds ${curOdds} < ${MIN_ODDS_THRESHOLD} and confidence ${p.confidence}% < ${MIN_CONFIDENCE_FOR_LOW_ODDS}%`);
+      await recordBet(col, history, betKey, 0);
+      oddsTracker.delete(fixture.eventId);
+      results.push({ ...p, status: 'SKIP', reason: `Odds ${curOdds} < ${MIN_ODDS_THRESHOLD} & Conf ${p.confidence}% < ${MIN_CONFIDENCE_FOR_LOW_ODDS}%` });
+      continue;
+    }
 
     // -- Place bet --
     try {
